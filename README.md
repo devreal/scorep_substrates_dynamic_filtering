@@ -3,9 +3,21 @@
 This plugin filters instrumentation calls from a binary instrumented with Score-P. Filtered calls
 are overwritten with `NOP`s to minimize overhead.
 
-This work is part of Philipp Trommlers bachelor's thesis. Results will be made available as soon as they're ready.
+This work has been part of Philipp Trommlers bachelor's thesis. Results will be made available as soon as they're ready.
 
-[![build status](https://api.travis-ci.org/rschoene/scorep_substrates_dynamic_filtering.svg)](https://travis-ci.org/rschoene/scorep_substrates_dynamic_filtering)
+
+## Changes from the original implementation
+
+This fork is based on the [original implementation](https://github.com/rschoene/scorep_substrates_dynamic_filtering).
+The main differences are as follows:
+
+- The instrumentation call-site detection was modified to use a **callee-based mechanism**: the call-site is detected by moving up one stack level from Score-P's instrumention function that is being called. The original implementation used a caller-based mechanism, which looked for the `call` instruction with the target pointing to the instrumention function. Unfortunately, this scheme does not work with dynamically linked Score-P libraries as the PLT indirection cannot be detected. The new scheme reliably works with both static and dynamic Score-P libraries. However, the new mechanism indiscriminatorily patches the call-site of the stack frame in which the instrumention function resides. It is thus important that your application is **built without sibling call optimization (by specifying `-fno-optimize-sibling-calls`, see the Known issues section below)** as otherwise the *call to the instrumented function* will be removed instead of the *instrumentation call*. Unfortunately, there is no way to otherwise avoid this optimization or to reliably detect it.
+
+- This version of the plugin relies on an **experimental substrate plugin API extension of Score-P**, which adds filtering hooks to region-enter and -exit event handling calls and allows the plugin to prevent any state changes within Score-P if a filtered function is detected. The patch necessary for Score-P 6.0 can be found in the `score-p` directory. Compilation of the plugin will fail with vanilla Score-P 6.0.
+
+- By using the new filter hooks, the plugin can **filter multiple call-sites of the same region**, which is important for inlined C/C++ functions.
+
+- The filtering hooks also allow for **multiple threads to remove instrumention immediately** instead of relying on single-threaded execution after a join to remove instrumentation by the main thread. This has been useful in dealing with non-OpenMP parallelization schemes such as Intel TBB.
 
 ## Compilation and Installation
 
@@ -37,6 +49,11 @@ To compile this plugin, you need:
 
         cmake .. -DSCOREP_CONFIG=<PATH_TO_YOUR_SCOREP_ROOT_DIR>/bin/scorep-config
 
+    If your libunwind installation is in a non-standard path, you have to manually pass that path
+    to CMake:
+
+        cmake .. -DLIBUNWIND_ROOT=<PATH_TO_YOUR_LIBUNWIND_ROOT_DIR>
+
     If you want to build the plugin with a more verbose debug output, you can invoke CMake as
     follows:
 
@@ -48,13 +65,6 @@ To compile this plugin, you need:
     [here](http://troydhanson.github.io/uthash/userguide.html#hash_functions), e.g.:
 
         cmake .. -DHASH_FUNCTION=HASH_JEN
-
-    By default, only the first 512 created threads are observed by the plugin. If your program uses
-    more than 512 threads and you want all of them to be observed, you can increase this maximum
-    by passing a higher value as `MAX_THREAD_CNT` to CMake. You can also lower the number of
-    observed threads which may lead to a slightly lower overhead (but may also change the results).
-
-        cmake .. -DMAX_THREAD_CNT=1024
 
 3. Invoke make
 
@@ -103,16 +113,17 @@ The configuration of the plugin is done via environment variables.
     
     
 ### Known issues
-The compiler optimization `-foptimize-sibling-calls` is usually enabled for icc/gcc at -O2 and -O3. This will be detected by the plugin but the calls cannot be patched in this case. If you want to avoid this, but still use the other optimizations, just pass `-fno-optimize-sibling-calls` to your compiler.
+The compiler optimization `-foptimize-sibling-calls` is usually enabled for icc/gcc at -O2 and -O3. This option allows the compiler to replace `call` instructions with `jmp` instruction if the called function can safely be executed in the same stack frame. **The plugin will not detect this automatically!** It is likely that your application will provide wrong results in this case. If you want to avoid this, but still use the other optimizations, just pass `-fno-optimize-sibling-calls` to your compiler.
 
-The plugin only works when there is exactly one enter and one exit function for every instrumented function. This will probably not be the case with C++ programs.
 ### If anything fails
 
 1. Check whether the plugin library can be loaded from the `LD_LIBRARY_PATH`
 
 2. Check whether you provide sane values for the environment variables.
 
-3. Open an [issue on Github](https://github.com/Ferruck/scorep_substrates_dynamic_filtering/issues).
+3. Check that your application was built with the `-fno-optimize-sibling-calls` compiler option.
+
+4. Open an [issue on Github](https://github.com/Ferruck/scorep_substrates_dynamic_filtering/issues).
 
 ## License
 
@@ -121,7 +132,8 @@ For information regarding the license of this plugin, see
 the license of `uthash` see
 [uthash.LICENSE](https://github.com/Ferruck/scorep_substrates_dynamic_filtering/blob/master/uthash.LICENSE).
 
-## Author
+## Authors
 
 * Philipp Trommler (https://github.com/Ferruck)
 * Robert Schoene (robert dot schoene at tu-dresden dot de)
+* Joseph Schuchart (joseph dot schuchart at hlrs dot de)
