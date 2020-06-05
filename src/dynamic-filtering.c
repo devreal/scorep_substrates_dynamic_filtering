@@ -805,19 +805,37 @@ static void on_write_data( void )
 
             region_info *current, *tmp;
             bool first = true;
+            bool mangled_mode = false;
+            const char* filter  = "EXCLUDE";
+            const char* spacing = "       ";
 
             HASH_ITER( hh, regions, current, tmp )
             {
                 if( current->inactive || current->optimized )
                 {
+                    bool is_mangled = false;
+                    if (current->region_name[0] == '_' && current->region_name[1] == 'Z') is_mangled = true;
+                    if (!mangled_mode && is_mangled) {
+                        // start a new EXCLUDE MANGLED statement
+                        first = true;
+                        mangled_mode = true;
+                        filter  = "EXCLUDE MANGLED";
+                        spacing = "               ";
+                    }
+                    if (mangled_mode && !is_mangled) {
+                        // start a new EXCLUDE MANGLED statement
+                        first = true;
+                        filter  = "EXCLUDE";
+                        spacing = "       ";
+                    }
                     if( first )
                     {
-                        fprintf( fp, "EXCLUDE MANGLED %s\n", current->region_name );
+                        fprintf( fp, "%s %s\n", filter, current->region_name );
                         first = false;
                     }
                     else
                     {
-                        fprintf( fp, "        %s\n", current->region_name );
+                        fprintf( fp, "%s %s\n", spacing, current->region_name );
                     }
                 }
             }
