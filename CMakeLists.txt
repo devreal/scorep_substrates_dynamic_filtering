@@ -3,7 +3,6 @@ project(scorep_substrate_dynamic_filtering)
 
 option(BUILD_DEBUG "Include debugging symbols in library and print some usefull output on execution." OFF)
 set(HASH_FUNCTION "HASH_OWN" CACHE STRING "Use other than identity function as hash. See uthash docs for more info.")
-set(MAX_THREAD_CNT "512" CACHE STRING "Change maximum number of observed threads.")
 
 set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/common)
 
@@ -11,7 +10,7 @@ find_package(Scorep REQUIRED)
 
 set(PLUGIN_SOURCE_FILES ${PROJECT_SOURCE_DIR}/src/dynamic-filtering.c)
 
-add_definitions("-Wall -Wextra -pedantic -std=c11 -DHASH_FUNCTION=${HASH_FUNCTION} -DMAX_THREAD_CNT=${MAX_THREAD_CNT}")
+add_definitions("-Wall -Wextra -pedantic -std=c11 -DHASH_FUNCTION=${HASH_FUNCTION}")
 
 if(BUILD_DEBUG)
 	add_definitions("-ggdb -DDYNAMIC_FILTERING_DEBUG")
