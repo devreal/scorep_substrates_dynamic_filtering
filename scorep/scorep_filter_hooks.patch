@@ -1,0 +1,116 @@
+diff --git a/include/scorep/SCOREP_SubstrateEvents.h b/include/scorep/SCOREP_SubstrateEvents.h
+index 3e53a89..77a4f2a 100644
+--- a/include/scorep/SCOREP_SubstrateEvents.h
++++ b/include/scorep/SCOREP_SubstrateEvents.h
+@@ -147,6 +147,9 @@ typedef enum SCOREP_Substrates_EventType
+     SCOREP_EVENT_IO_RELEASE_LOCK,                 /**< marks the release of an I/O lock, see SCOREP_Substrates_IoReleaseLockCb */
+     SCOREP_EVENT_IO_TRY_LOCK,                     /**< called when , see SCOREP_Substrates_IoTryLockCb */
+ 
++    SCOREP_EVENT_PRE_ENTER_REGION,                /**< called before entering a region, may signal to ignore it */
++    SCOREP_EVENT_PRE_EXIT_REGION,                 /**< called before leaving a region, may signal to ignore it */
++
+     SCOREP_SUBSTRATES_NUM_EVENTS                  /**< Non-ABI, marks the end of the currently supported events and can change with different versions of Score-P (increases with increasing Score-P version) */
+ } SCOREP_Substrates_EventType;
+ 
+@@ -259,6 +262,34 @@ typedef void ( * SCOREP_Substrates_ExitRegionCb )(
+     SCOREP_RegionHandle     regionHandle,
+     uint64_t*               metricValues );
+ 
++/**
++ * called before entering a region via some instrumentation adapter.
++ * No state inside the measurement system has been changed yet.
++ *
++ * @param location location which creates this event
++ *
++ * @param timestamp timestamp for this event
++ *
++ * @param regionHandle region that is entered
++ *
++ * @param ignore whether the measurement system should ignore the event
++ */
++typedef void ( * SCOREP_Substrates_PreEnterRegionCb )(
++    struct SCOREP_Location* location,
++    uint64_t                timestamp,
++    SCOREP_RegionHandle     regionHandle,
++    int*                    ignore );
++
++/**
++ * called before exiting a region via some instrumentation adapter
++ * @see SCOREP_Substrates_PreEnterRegionCb
++ */
++typedef void ( * SCOREP_Substrates_PreExitRegionCb )(
++    struct SCOREP_Location* location,
++    uint64_t                timestamp,
++    SCOREP_RegionHandle     regionHandle,
++    int*                    ignore );
++
+ /**
+  * called when a sampling adapter interrupts the workload and records a sample.
+  * Called from a signal handler, so used functions should be async-signal safe.
+diff --git a/src/measurement/SCOREP_Events.c b/src/measurement/SCOREP_Events.c
+index 2319d89..7fb97be 100644
+--- a/src/measurement/SCOREP_Events.c
++++ b/src/measurement/SCOREP_Events.c
+@@ -154,13 +154,29 @@ enter_region( SCOREP_Location*    location,
+               SCOREP_RegionHandle regionHandle,
+               uint64_t*           metricValues )
+ {
++    int filter = 0;
+     UTILS_DEBUG_PRINTF( SCOREP_DEBUG_EVENTS, "Reg:%u",
+                         SCOREP_Definitions_HandleToId( regionHandle ) );
+ 
+-    SCOREP_Task_Enter( location, regionHandle );
++    SCOREP_Substrates_PreEnterRegionCb * substrate_cb;
++    substrate_cb = ( SCOREP_Substrates_PreEnterRegionCb* ) & ( scorep_substrates[ SCOREP_EVENT_PRE_ENTER_REGION * scorep_substrates_max_substrates ] );
++    if (*substrate_cb != NULL) {
++        (*substrate_cb)(location, timestamp, regionHandle, &filter);
++        if (*(++substrate_cb) != NULL) {
++            static bool print_warning = true;
++            if (print_warning) {
++                print_warning = false;
++                fprintf(stderr, "WARN: ignoring all but the first ENTER filter callback!");
++            }
++        }
++    }
++
++    if (!filter) {
++        SCOREP_Task_Enter( location, regionHandle );
+ 
+-    SCOREP_CALL_SUBSTRATE( EnterRegion, ENTER_REGION,
+-                           ( location, timestamp, regionHandle, metricValues ) );
++        SCOREP_CALL_SUBSTRATE( EnterRegion, ENTER_REGION,
++                               ( location, timestamp, regionHandle, metricValues ) );
++    }
+ }
+ 
+ 
+@@ -290,10 +306,26 @@ exit_region( SCOREP_Location*    location,
+     UTILS_DEBUG_PRINTF( SCOREP_DEBUG_EVENTS, "Reg:%u",
+                         SCOREP_Definitions_HandleToId( regionHandle ) );
+ 
+-    SCOREP_CALL_SUBSTRATE( ExitRegion, EXIT_REGION,
+-                           ( location, timestamp, regionHandle, metricValues ) );
++    int filter = 0;
++    SCOREP_Substrates_PreExitRegionCb * substrate_cb;
++    substrate_cb = ( SCOREP_Substrates_PreExitRegionCb* ) & ( scorep_substrates[ SCOREP_EVENT_PRE_EXIT_REGION * scorep_substrates_max_substrates ] );
++    if (*substrate_cb != NULL) {
++        (*substrate_cb)(location, timestamp, regionHandle, &filter);
++        if (*(++substrate_cb) != NULL) {
++            static bool print_warning = true;
++            if (print_warning) {
++                print_warning = false;
++                fprintf(stderr, "WARN: ignoring all but the first ENTER filter callback!");
++            }
++        }
++    }
++
++    if (!filter) {
++        SCOREP_CALL_SUBSTRATE( ExitRegion, EXIT_REGION,
++                               ( location, timestamp, regionHandle, metricValues ) );
+ 
+-    SCOREP_Task_Exit( location );
++        SCOREP_Task_Exit( location );
++    }
+ }
+ 
+ 
