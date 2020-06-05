@@ -37,6 +37,18 @@
 
 #include "uthash.h"
 
+#define likely(x)   __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
+/* Value to which the num_active field is set to signal that the region is to be deleted */
+#define DELETION_SIGNAL (INT32_MIN)
+
+/* Minimum number of calls before any filtering kicks in */
+#define MIN_NUM_CALLS 100
+
+/* Number of events between updates of the mean time used for dynamic filtering */
+#define DYNAMIC_UPDATE_INTERVAL 1000
+
 /**
  * Stores region info.
  */
@@ -44,88 +56,34 @@ typedef struct region_info
 {
     /** Handle for uthash usage */
     UT_hash_handle hh;
+    /** Number of threads active in this region (negative if to be deleted) */
+    int64_t  num_active;
+    /** The Score-P region handle */
+    SCOREP_RegionHandle region_handle;
     /** Global counter for region entries */
     uint64_t call_cnt;
     /** Global calculated region duration */
     uint64_t duration;
     /** Timestamp of last enter into this region (used by main thread) */
     uint64_t last_enter;
-    /** Pointer to the callq for the enter instrumentation function */
-    char* enter_func;
-    /** Pointer to the callq for the exit instrumentation function */
-    char* exit_func;
     /** Human readable name of the region */
     char* region_name;
-    /** Handle identifying the region */
-    uint32_t region_handle;
-    /** Recursion depth in this region */
-    uint32_t depth;
     /** Mean region duration used for comparison */
     float mean_duration;
-    /** Marks whether the region is deletable */
-    bool deletable;
-    /** Marks whether the region has been deleted */
+    /** Marks whether the region has been marked for deletion */
     bool inactive;
     /** Marks whether the region is optimized beyond repair */
     bool optimized;
 } region_info;
 
-/**
- * Stores calling information per thread.
- *
- * This is necessary as otherwise all on_exit_region and on_enter_region calls need to be
- * serialized.
- */
-typedef struct local_region_info
-{
-    /** Handle for uthash usage */
-    UT_hash_handle hh;
-    /** Local counter for region entries */
-    uint64_t call_cnt;
-    /** Local calculated region duration */
-    uint64_t duration;
-    /** Timestamp of last enter into this region */
-    uint64_t last_enter;
-    /** Region id this info belongs to */
-    uint32_t region_handle;
-    /** Pointer to the callq for the enter instrumentation function */
-    char* enter_func;
-    /** Pointer to the callq for the exit instrumentation function */
-    char* exit_func;
-    /** Marks whether the region is optimized beyond repair */
-    bool optimized;
-    /** Human readable name of the region */
-    char* region_name;
-} local_region_info;
-
 /** Global list of defined regions */
 static region_info* regions = NULL;
-
-/** Number of created threads */
-static uint32_t num_threads = 0;
-
-/** Default to max 512 threads that are observed */
-#ifndef MAX_THREAD_CNT
-#define MAX_THREAD_CNT 512
-#endif
-
-/** Thread local region info */
-static local_region_info* local_info_array[MAX_THREAD_CNT];
-
-/** Thread-local index for accessing the thread-local part of the array */
-static __thread uint32_t local_info_array_index;
 
 /** General mutex used as a guard for writing region info */
 static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
 
-/** Special mutex used for protecting the thread counter */
-static pthread_mutex_t thread_ctr_mtx = PTHREAD_MUTEX_INITIALIZER;
-
-/** Special mutex used for protecting the number of threads */
-static pthread_mutex_t num_threads_mtx = PTHREAD_MUTEX_INITIALIZER;
-
-/** Thread counter */
-static uint64_t thread_ctr = 0;
+/** Mutex to protect the update of the meantime */
+static pthread_mutex_t mean_duration_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /** Flag indicating the filtering method to be used (true = absolute, false = relative) */
 static bool filtering_absolute = true;
@@ -136,9 +94,6 @@ static unsigned long long threshold = 100000;
 /** Mean duration across all regions */
 static float mean_duration = 0;
 
-/** Flag indicating that this current thread is the main thread */
-static __thread bool main_thread = false;
-
 /** Internal substrates id */
 static size_t id;
 
@@ -148,19 +103,84 @@ static const SCOREP_SubstratePluginCallbacks* callbacks;
 /** Name of the enter region instrumentation call */
 static char* enter_func = NULL;
 
+/** IP of the enter region instrumentation call */
+static char *enter_func_ip = NULL;
+
 /** Name of the exit region instrumentation call */
 static char* exit_func = NULL;
 
+/** IP of the exit region instrumentation call */
+static char *exit_func_ip = NULL;
+
 /** Whether to continue despite having detected strong optimizations */
-static bool continue_despite;
+static bool continue_despite = true;
 
 /** Whether to create an optimization report */
-static bool create_report;
+static bool create_report = false;
 
 /** Whether to write a filter file */
-static bool create_filter;
+static bool create_filter = false;
 
-static unsigned long long base_pointer;
+typedef struct region_stack_elem_t region_stack_elem_t;
+struct region_stack_elem_t {
+  region_stack_elem_t        *next;
+  region_info                *region;
+  uint64_t                    timestamp;
+};
+
+static __thread region_stack_elem_t *shadow_stack = NULL;
+static __thread region_stack_elem_t *region_stack_freelist = NULL;
+
+static inline void shadow_stack_push(region_info *region, uint64_t timestamp)
+{
+    region_stack_elem_t *elem;
+    if (region_stack_freelist != NULL) {
+        elem = region_stack_freelist;
+        region_stack_freelist = elem->next;
+        elem->next = NULL;
+    } else {
+        elem = malloc(sizeof(*elem));
+    }
+
+    elem->region = region;
+    elem->timestamp = timestamp;
+    elem->next   = shadow_stack;
+    shadow_stack = elem;
+}
+
+static inline region_info* shadow_stack_pop(void)
+{
+    region_stack_elem_t *elem = shadow_stack;
+    region_info         *ret  = elem->region;
+    shadow_stack = elem->next;
+
+    /* push elem onto freelist */
+    elem->next = region_stack_freelist;
+    region_stack_freelist = elem;
+
+    return ret;
+}
+
+
+static inline region_stack_elem_t* shadow_stack_top(void)
+{
+    return shadow_stack;
+}
+
+static inline bool shadow_stack_empty()
+{
+    return shadow_stack == NULL;
+}
+
+static inline void shadow_stack_cleanup()
+{
+    region_stack_elem_t *elem;
+    while (!shadow_stack_empty()) shadow_stack_pop();
+    while (NULL != (elem = region_stack_freelist)) {
+        region_stack_freelist = elem->next;
+        free(elem);
+    }
+}
 
 /**
  * Update the mean duration of all regions.
@@ -169,6 +189,15 @@ static unsigned long long base_pointer;
  */
 static void update_mean_duration( )
 {
+    // don't update on every call
+    static __thread uint64_t update_count = 0;
+    if (++update_count < DYNAMIC_UPDATE_INTERVAL) return;
+
+    // skip if another thread is already updating
+    if (0 != pthread_mutex_trylock(&mean_duration_mtx)) return;
+
+    update_count = 0;
+
     region_info *current, *tmp;
     uint64_t ctr = 1;
     float new_duration = 0;
@@ -176,11 +205,7 @@ static void update_mean_duration( )
     HASH_ITER( hh, regions, current, tmp )
     {
         // Only use active regions for calculating the mean duration.
-#ifdef DYNAMIC_FILTERING_DEBUG
         if( !current->inactive )
-#else
-        if( !current->deletable && !current->inactive )
-#endif
         {
             new_duration += current->mean_duration;
             ctr++;
@@ -188,40 +213,52 @@ static void update_mean_duration( )
     }
 
     mean_duration = new_duration / ctr;
+
+    pthread_mutex_unlock(&mean_duration_mtx);
 }
 
 /**
- * Overrides a callq at the given position with a five byte NOP.
+ * Overwrites a callq at the given position with a five byte NOP.
  *
  * By calling mprotect right before and after writing the NOP this function ensures that the correct
  * part of the TXT segment is writable and it's only writable as long as needed.
  *
- * @param   ptr                             Position of the callq to override.
+ * @param   ptr                             Position of the callq to overwrite.
  */
-static void override_callq( char*                                             ptr )
+static void overwrite_callq( char*                                             ptr )
 {
+    // the NOP used to overwrite the instrumentation call
+    const char nop[] = { 0x0f, 0x1f, 0x44, 0x00, 0x00 };
+    // check whether another thread has already overwritten it
+    bool all_same = true;
+    for (size_t i = 0; i < sizeof(nop); ++i) {
+        if (nop[i] != ptr[i]) {
+            all_same = false;
+            break;
+        }
+    }
+    if (all_same) return;
     // Get the page size of the system we're running on.
-    int page_size = sysconf( _SC_PAGE_SIZE );
-    // The callq may be splitted onto two different pages and mprotect changes access permissions
+    size_t page_size = sysconf( _SC_PAGE_SIZE );
+    // The callq may span two different pages and mprotect changes access permissions
     // on a per page basis, so we need to change the access permission on the pages where the first
     // and the last byte of the callq reside.
-    void* first_ptr = ptr - ( (unsigned long) ptr % page_size );
-    void* second_ptr = ( ptr + 4 ) - ( (unsigned long) ( ptr + 4 ) % page_size );
+    void* first_page  = (void*)(((intptr_t)ptr)   & ~(page_size - 1));
+    void* second_page = (void*)(((intptr_t)ptr+4) & ~(page_size - 1));
 
     // Add the write permission.
-    if( mprotect( first_ptr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC ) != 0
-     || mprotect( second_ptr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC ) != 0 )
+    if( mprotect( first_page, page_size, PROT_READ | PROT_WRITE | PROT_EXEC ) != 0
+     || (first_page != second_page && mprotect( second_page, page_size, PROT_READ | PROT_WRITE | PROT_EXEC ) != 0 ))
     {
         fprintf( stderr,  "Could not add write permission to memory access rights on position "
                           "%p", ptr );
     }
     // Finally write that NOP.
-    const char nop[] = { 0x0f, 0x1f, 0x44, 0x00, 0x00 };
-    memmove( ptr, nop, sizeof( char ) * 5 );
+    memmove( ptr, nop, sizeof( nop ) );
 
     // Remove the write permission.
-    if( mprotect( first_ptr, page_size, PROT_READ | PROT_EXEC ) != 0
-     || mprotect( second_ptr, page_size, PROT_READ | PROT_EXEC ) != 0 )
+    if( mprotect( first_page, page_size, PROT_READ | PROT_EXEC ) != 0
+     || (first_page != second_page && mprotect( second_page, page_size, PROT_READ | PROT_EXEC ) != 0 ))
     {
         fprintf( stderr,  "Could not remove write permission to memory access rights on position "
                           "%p", ptr );
@@ -290,6 +327,49 @@ static bool printed_warning;
 #define DISPLACEMENT(JMPQ_ADDRESS) \
     (((int64_t) JMPQ_ADDRESS[4])<<24 | ((int64_t) JMPQ_ADDRESS[3])<<16 | ((int64_t) JMPQ_ADDRESS[2])<<8 | ((int64_t) JMPQ_ADDRESS[1]))
 
+static char *get_instrumentation_call_ip(unw_context_t *uc, int is_enter)
+{
+    if (is_enter) {
+        if (enter_func_ip != NULL) return enter_func_ip;
+    } else {
+        if (exit_func_ip != NULL) return exit_func_ip;
+    }
+
+    unw_cursor_t cursor;
+    unw_word_t offset;
+    char sym[256];
+
+    unw_init_local( &cursor, uc );
+
+    // Step up the call path...
+    while( unw_step( &cursor ) > 0 )
+    {
+        int ret;
+        unw_word_t ip;
+        // ... and check the function name against all know instrumentation call names.
+        ret = unw_get_proc_name( &cursor, sym, sizeof( sym ), &offset );
+        if (ret != 0) fprintf(stderr, "WARN: unw_get_proc_name returned %d\n", ret);
+        unw_get_reg( &cursor, UNW_REG_IP, &ip );
+
+        if (is_enter) {
+            if( strcmp( sym, enter_func ) == 0 )
+            {
+                printf("Found ENTER func IP %p\n", ip);
+                enter_func_ip = (char*)ip;
+                return enter_func_ip;
+            }
+        } else {
+            if( strcmp( sym, exit_func ) == 0 )
+            {
+                printf("Found EXIT func IP %p\n", ip);
+                exit_func_ip = (char*)ip;
+                return exit_func_ip;
+            }
+        }
+    }
+
+    return NULL;
+}
 
 static char* get_function_call_ip( int is_enter )
 {
@@ -298,294 +378,129 @@ static char* get_function_call_ip( int is_enter )
     unw_word_t ip;
 
     unw_getcontext( &uc );
-    unw_init_local( &cursor, &uc );
 
-    unsigned char * target_address_scorep = dlsym(RTLD_DEFAULT, is_enter? enter_func:exit_func );
+    char *instr_func_ip = get_instrumentation_call_ip(&uc, is_enter);
+    assert(instr_func_ip != NULL);
+
+    unw_init_local( &cursor, &uc );
 
     // Step up the call path...
     while( unw_step( &cursor ) > 0 )
     {
         unw_get_reg( &cursor, UNW_REG_IP, &ip );
 
-        unsigned char* assumed= (unsigned char*) ( ip - 5 );
-        unsigned char * jmp_adr =(unsigned char*) (DISPLACEMENT(assumed));
-        if (jmp_adr+(ip) == target_address_scorep )
-            return (char*) assumed;
-
+        if ((char*)ip == instr_func_ip) {
+            /* step up one more and treat that as the call-site */
+            if ( unw_step( &cursor ) <= 0 ) {
+#ifdef DYNAMIC_FILTERING_DEBUG
+                fprintf(stderr, "Failed to step out of Score-P instrumentation function  %s (%p)\n", is_enter ? enter_func : exit_func, instr_func_ip);
+#endif
+                return NULL;
+            }
+            unw_get_reg( &cursor, UNW_REG_IP, &ip );
+            char* assumed= (char*) ( ip - 5 );
+            return assumed;
+        }
     }
 
     // This shouldn't happen, if we're on this point, we tried to delete a function not present in
     // the current call path. We return zero in this case because delete_regions wont try to delete
     // this call in this case and we get no undefined behaviour.
-    return (char*) 0;
+    return NULL;
 }
 
 /**
- * Remove all unwanted regions.
+ * Pre-Enter region.
  *
- * This function iterates over all regions and deletes all of them that are marked as deletable. The
- * iteration over the elements isn't guarded by locks because the program's semantic ensures that
- * this function is only called when there's only one thread present.
- */
-static void delete_regions( )
-{
-    region_info *current, *tmp;
-
-    HASH_ITER( hh, regions, current, tmp )
-    {
-        // Only delete the function calls if the region is marked as deletable, the address of the
-        // entry function call and the address of the exit function call are correctly set and the
-        // call stack depth for the function is zero (we're not currently in a recursive call of
-        // that function).
-        if( !current->inactive
-            && current->deletable
-            && current->depth == 0
-            && !( current->enter_func == 0 || current->exit_func == 0 ) )
-        {
-            override_callq( current->enter_func );
-            override_callq( current->exit_func );
-            current->inactive = true;
-#ifdef DYNAMIC_FILTERING_DEBUG
-            fprintf( stderr, "Deleted instrumentation calls for region %s!\n",
-                                                                        current->region_name );
-#endif
-        }
-    }
-}
-
-/**
- * Team begin event.
- *
- * As long as there's multithreaded execution, there's no safe way to filter functions. So we've to
- * notice the begin of a multithreaded part of execution to stop filtering.
+ * This registers an active thread on the region. If the region has been marked
+ * to be deleted the \c ignore flag is set. If there are no active threads in this
+ * region, the instrumentation point is removed by the calling thread.
+ * Note that multiple threads may attempt to remove the same instrumentation point,
+ * which should not cause any harm.
  *
  * @param   scorep_location                 unused
  * @param   timestamp                       unused
- * @param   scorep_paradigm                 unused
- * @param   scorep_thread_team              unused
- */
-static void on_team_begin( __attribute__((unused)) struct SCOREP_Location*          scorep_location,
-                           __attribute__((unused)) uint64_t                         timestamp,
-                           __attribute__((unused)) SCOREP_ParadigmType              scorep_paradigm,
-                           __attribute__((unused)) SCOREP_InterimCommunicatorHandle scorep_thread_team )
-{
-    if (printed_warning && !continue_despite) return;
-    pthread_mutex_lock( &thread_ctr_mtx );
-    thread_ctr++;
-    pthread_mutex_unlock( &thread_ctr_mtx );
-}
-
-/**
- * Team end event.
- *
- * See on_team_begin.
- *
- * @param   scorep_location                 unused
- * @param   timestamp                       unused
- * @param   scorep_paradigm                 unused
- * @param   scorep_thread_team              unused
- */
-static void on_team_end( __attribute__((unused)) struct SCOREP_Location*            scorep_location,
-                         __attribute__((unused)) uint64_t                           timestamp,
-                         __attribute__((unused)) SCOREP_ParadigmType                scorep_paradigm,
-                         __attribute__((unused)) SCOREP_InterimCommunicatorHandle   scorep_thread_team )
-{
-    if (printed_warning && !continue_despite) return;
-    pthread_mutex_lock( &thread_ctr_mtx );
-    thread_ctr--;
-    pthread_mutex_unlock( &thread_ctr_mtx );
-}
-
-/**
- * Thread join event.
- *
- * This is emitted when all threads finished on_team_end. As all information is gathered in the
- * global storage, the main thread can recalculate the metrics.
- *
- * @param scorep_location                   unused
- * @param timestamp                         unused
- * @param scorep_paradigm                   unused
- */
-void on_join( __attribute__((unused)) struct SCOREP_Location*                       scorep_location,
-              __attribute__((unused)) uint64_t                                      timestamp,
-              __attribute__((unused)) SCOREP_ParadigmType                           paradigm_type )
-{
-    if (printed_warning && !continue_despite) return;
-    region_info *to_change, *tmp;
-
-    // Recalculate all filter decisions.
-    HASH_ITER( hh, regions, to_change, tmp )
-    {
-        uint32_t border = num_threads > MAX_THREAD_CNT ? MAX_THREAD_CNT : num_threads;
-
-
-        // Combine the locally gathered information with the global ones.
-        for( uint32_t i = 0; i < border; ++i )
-        {
-            local_region_info* local;
-            HASH_FIND( hh, local_info_array[i], &to_change->region_handle,
-                                                                    sizeof( uint32_t ), local );
-
-            if( local != NULL )
-            {
-                to_change->call_cnt += local->call_cnt;
-                local->call_cnt = 0;
-                to_change->duration += local->duration;
-                local->duration = 0;
-
-                if( to_change->enter_func == 0 && local->enter_func != 0 )
-                {
-                    to_change->enter_func = local->enter_func;
-                }
-
-                if( to_change->exit_func == 0 && local->exit_func != 0 )
-                {
-                    to_change->exit_func = local->exit_func;
-                }
-                if ( !to_change->optimized && local->optimized )
-                {
-                    to_change->optimized = true;
-                }
-            }
-        }
-        if( filtering_absolute )
-        {
-            // We're filtering absolute so just compare this region's mean duration with the
-            // threshold.
-            if( ( (float) to_change->duration / to_change->call_cnt ) < threshold )
-            {
-                to_change->deletable = true;
-            }
-        }
-        else
-        {
-            // We're filtering relative so first update all regions' mean durations and then
-            // compare the duration of this region with the mean of all regions.
-            if( to_change->call_cnt == 0 )
-            {
-                to_change->mean_duration = 0;
-            }
-            else
-            {
-                to_change->mean_duration = (float) to_change->duration / to_change->call_cnt;
-            }
-
-            update_mean_duration( );
-
-            if( to_change->mean_duration < mean_duration - threshold )
-            {
-                to_change->deletable = true;
-            }
-        }
-    }
-    pthread_mutex_lock( &thread_ctr_mtx );
-    if( thread_ctr == 0 )
-    {
-        // Single threaded execution, time for filtering.
-        delete_regions( );
-    }
-    pthread_mutex_unlock( &thread_ctr_mtx );
-}
-
-/**
- * Enter region.
- *
- * This updates the region info (call counter) and decides whether or not the region instrumentation
- * should be overwritten. If so, it checks if we're in a multi threaded environment and acts
- * accordingly:
- *
- *  * multithreaded: Skip deletion and wait untill all threads are joined.
- *  * singlethreaded: Mark the state as deletion ready and hold a mutex so that no new spawned
- *    thread can enter a possibly deleted region.
- *
- * @param   scorep_location                 unused
- * @param   timestamp                       The timestamp of the entry event.
  * @param   region_handle                   The region that is entered.
- * @param   metric_values                   unused
+ * @param   ignore                          Set to 1 if the region should be ignored.
  */
-static void on_enter_region( __attribute__((unused)) struct SCOREP_Location*        scorep_location,
-                             uint64_t                                               timestamp,
-                             SCOREP_RegionHandle                                    region_handle,
-                             __attribute__((unused)) uint64_t*                      metric_values )
+static void on_pre_enter_region( __attribute__((unused)) struct SCOREP_Location*    scorep_location,
+                                 uint64_t                                           timestamp,
+                                 SCOREP_RegionHandle                                region_handle,
+                                 int*                                               ignore )
 {
-    if (printed_warning && !continue_despite) return;
-    // Skip the undeletable functions!
+
     if( callbacks->SCOREP_RegionHandle_GetParadigmType( region_handle ) != SCOREP_PARADIGM_COMPILER )
     {
         return;
     }
 
+    region_info* region;
+    HASH_FIND( hh, regions, &region_handle, sizeof( uint32_t ), region );
+
     // Once per runtime determine which instrumentation calls are used in this binary.
-    if( !enter_func || !exit_func )
+    if( unlikely(!enter_func || !exit_func) )
     {
-        get_instrumentation_call_type( );
+        pthread_mutex_lock(&mtx);
+        if( !enter_func || !exit_func ) {
+            get_instrumentation_call_type( );
+            get_function_call_ip(true);
+        }
+        pthread_mutex_unlock(&mtx);
     }
 
-    // The function could be overwritten. Process it further.
-    if( main_thread )
-    {
-        region_info* region;
-        HASH_FIND( hh, regions, &region_handle, sizeof( uint32_t ), region );
 
-        if (region->optimized)
-            return;
-
-        // Check for missing instruction pointer.
-        if( !region->enter_func )
-        {
-            region->enter_func = get_function_call_ip( 1 );
-            if ( region->enter_func == NULL )
-                region->optimized = true;
-        }
-
-        // If the current region is already deleted, skip this whole thing.
-        if( !region->inactive )
-        {
-            pthread_mutex_lock( &mtx );
-            region->last_enter = timestamp;
-            region->depth++;
-            pthread_mutex_unlock( &mtx );
-        }
+    bool need_decrement = false;
+    int64_t num_active = region->num_active;
+    if (num_active >= 0) {
+        num_active = __sync_fetch_and_add(&region->num_active, 1);
+        need_decrement = true;
     }
-    else if( local_info_array_index < MAX_THREAD_CNT )
-    {
-        local_region_info* info;
-        HASH_FIND( hh, local_info_array[local_info_array_index], &region_handle, sizeof( uint32_t ),
-                                                                                            info );
-        if( info != NULL )
-        {
-            if (info->optimized)
-                return;
 
-            // Store the last (this) entry for the current thread.
-            info->last_enter = timestamp;
-
-            // Check for missing instruction pointer.
-            if( !info->enter_func )
-            {
-                info->enter_func = get_function_call_ip( 1 );
-                if ( info->enter_func == NULL )
-                    info->optimized = true;
+    /* if the value is negative we signal that the region should be ignored */
+    if (num_active < 0) {
+        *ignore = 1;
+        /* also mark as not active again */
+        if (need_decrement) {
+            num_active = __sync_fetch_and_sub(&region->num_active, 1);
+        }
+        /* if there are no other active threads we can safely delete it */
+        // TODO: can we delete the *entery* point even if there are still active threads?
+        // NOTE: wait until we have detected the exit_func_ip, otherwise libunwind seems to trip
+        if (exit_func_ip != NULL) {
+            /* serialize patching */
+            pthread_mutex_lock(&mtx);
+            char* ip = get_function_call_ip(true);
+            if (ip == NULL) {
+                fprintf(stderr, "Cannot remove enter instrumentation for function %s, unknown instrumentation?\n",
+                        callbacks->SCOREP_RegionHandle_GetCanonicalName( region->region_handle ));
+            } else {
+                //printf("Patching out ENTER instrumentation for %s at IP %p\n", callbacks->SCOREP_RegionHandle_GetCanonicalName( region->region_handle ), ip);
+                overwrite_callq(ip);
             }
+            pthread_mutex_unlock(&mtx);
         }
+    } else {
+        // the region is active, push it onto shadow stack
+        shadow_stack_push(region, timestamp);
     }
+
 }
 
 /**
- * Exit region.
+ * Pre-Exit region.
  *
  * This method contains the code for calculating metrics (see on_enter as well) and the actual
- * instrumentation override code.
+ * instrumentation overwrite code.
  *
  * @param   scorep_location                 unused
  * @param   timestamp                       Time of the exit from the region.
  * @param   region_handle                   The region that is exited.
  * @param   metric_values                   unused
  */
-static void on_exit_region( __attribute__((unused)) struct SCOREP_Location*         scorep_location,
-                            uint64_t                                                timestamp,
-                            SCOREP_RegionHandle                                     region_handle,
-                            __attribute__((unused)) uint64_t*                       metric_values )
+static void on_pre_exit_region( __attribute__((unused)) struct SCOREP_Location*         scorep_location,
+                                uint64_t                                                timestamp,
+                                SCOREP_RegionHandle                                     region_handle,
+                                int*                                                    ignore )
 {
     if (printed_warning && !continue_despite) return;
     // Skip the undeletable functions!
@@ -594,96 +509,84 @@ static void on_exit_region( __attribute__((unused)) struct SCOREP_Location*     
         return;
     }
 
-    // This function could be overwritten. Process it further.
-    if( main_thread )
-    {
-        region_info* region;
+    region_stack_elem_t *elem = shadow_stack_top();
+    region_info* region;
+    int64_t num_active;
+    // if that region is on the shadow stack we can use it directly
+    if (elem != NULL && region_handle == elem->region->region_handle) {
+        region = elem->region;
+        num_active = __sync_fetch_and_sub(&region->num_active, 1);
+        shadow_stack_pop();
+    } else {
+        // otherwise get it from the hash table and signal to ignore it
         HASH_FIND( hh, regions, &region_handle, sizeof( uint32_t ), region );
+        *ignore = 1;
+        num_active = region->num_active;
+    }
+
+    // This function could be overwritten. Process it further.
+    if( num_active > 0 )
+    {
 
         if (region->optimized)
             return;
 
-        region->depth--;
-
-        // Check for missing instruction pointer.
-        if( !region->exit_func )
-        {
-            region->exit_func = get_function_call_ip( 0 );
-            if ( region->exit_func == NULL )
-                region->optimized = true;
-        }
-
-        // If the region already has been deleted or marked as deletable, skip the next steps.
-#ifdef DYNAMIC_FILTERING_DEBUG
+        // If the region already has been marked as inactive, skip the next steps.
         if( !region->inactive )
-#else
-        if( !region->deletable && !region->inactive )
-#endif
         {
-            region->call_cnt++;
-            region->duration += ( timestamp - region->last_enter );
+            __sync_add_and_fetch(&region->duration, ( timestamp - elem->timestamp ));
+            uint64_t call_cnt = __sync_add_and_fetch(&region->call_cnt, 1);
 
-            if( filtering_absolute )
-            {
-                // We're filtering absolute so just compare this region's mean duration with the
-                // threshold.
-                if( ( (float) region->duration / region->call_cnt ) < threshold )
+            if (MIN_NUM_CALLS < call_cnt) {
+
+                if( filtering_absolute )
                 {
-                    region->deletable = true;
-                }
-            }
-            else
-            {
-                // We're filtering relative so first update all regions' mean durations and then
-                // compare the duration of this region with the mean of all regions.
-                if( region->call_cnt == 0 )
-                {
-                    region->mean_duration = 0;
+                    // We're filtering absolute so just compare this region's mean duration with the
+                    // threshold.
+                    if( ( (float) region->duration / region->call_cnt ) < threshold )
+                    {
+                        region->inactive = true;
+                    }
                 }
                 else
                 {
+                    // We're filtering relative so first update all regions' mean durations and then
+                    // compare the duration of this region with the mean of all regions.
                     region->mean_duration = (float) region->duration / region->call_cnt;
-                }
 
-                update_mean_duration( );
+                    update_mean_duration( );
 
-                if( region->mean_duration < mean_duration - threshold )
-                {
-                    region->deletable = true;
+                    if( region->mean_duration < mean_duration - threshold )
+                    {
+                        region->inactive = true;
+                    }
                 }
             }
-        }
 
-        pthread_mutex_lock( &thread_ctr_mtx );
-        if( thread_ctr == 0 )
-        {
-            // Single threaded execution, time for filtering.
-            delete_regions( );
+            if (region->inactive) {
+                int64_t num_active = __sync_add_and_fetch(&region->num_active, DELETION_SIGNAL);
+                if (num_active < DELETION_SIGNAL) {
+                    // someone else has signalled already, revert our signal
+                    __sync_sub_and_fetch(&region->num_active, DELETION_SIGNAL);
+                }
+            }
+
         }
-        pthread_mutex_unlock( &thread_ctr_mtx );
     }
-    else if( local_info_array_index < MAX_THREAD_CNT )
-    {
-        local_region_info* info;
-        HASH_FIND( hh, local_info_array[local_info_array_index], &region_handle, sizeof( uint32_t ),
-                                                                                            info );
 
-        if( info != NULL )
-        {
-            if (info->optimized)
-                return;
-            // Region not (yet) ready for deletion so update the metrics.
-            info->call_cnt++;
-            info->duration += ( timestamp - info->last_enter );
-
-            // Check for missing instruction pointer.
-            if( !info->exit_func )
-            {
-                info->exit_func = get_function_call_ip(  0 );
-                if ( info->exit_func == NULL )
-                    info->optimized = true;
-            }
+    // if all threads have left the region we can safely delete the exit instrumentation
+    // NOTE: wait until we have detected the enter_func_ip, otherwise libunwind seems to trip
+    if (region->num_active == DELETION_SIGNAL && enter_func_ip != NULL) {
+        pthread_mutex_lock(&mtx);
+        char* ip = get_function_call_ip(false);
+        if (ip == NULL) {
+            fprintf(stderr, "Cannot remove exit instrumentation for function %s, unknown instrumentation?\n",
+                    callbacks->SCOREP_RegionHandle_GetCanonicalName( region->region_handle ));
+        } else {
+            //printf("Patching out EXIT instrumentation for %s at IP %p\n", callbacks->SCOREP_RegionHandle_GetCanonicalName( region->region_handle ), ip);
+            overwrite_callq(ip);
         }
+        pthread_mutex_unlock(&mtx);
     }
 }
 
@@ -717,8 +620,7 @@ static void on_define_region( SCOREP_AnyHandle                                  
 
         new = calloc( 1, sizeof( region_info ) );
         new->region_handle = handle;
-        new->region_name = calloc( 1, strlen( region_name ) * sizeof( char ) );
-        memcpy( new->region_name, region_name, strlen( region_name ) * sizeof( char ) );
+        new->region_name = strdup(region_name);
 
         HASH_ADD( hh, regions, region_handle, sizeof( uint32_t ), new );
     }
@@ -737,43 +639,11 @@ static void on_define_region( SCOREP_AnyHandle                                  
  * @param   location                        The location which is created (unused).
  * @param   parent_location                 The location's parent location (unused).
  */
-void on_create_location( const struct SCOREP_Location*                                    location,
+void on_create_location( __attribute__((unused)) const struct SCOREP_Location*            location,
                          __attribute__((unused)) const struct SCOREP_Location*            parent_location )
 {
+    // TODO: is this callback still needed?
     if (printed_warning && !continue_despite) return;
-    if( callbacks->SCOREP_Location_GetId( location ) == 0 )
-    {
-        // Mark the main thread as the main thread.
-        main_thread = true;
-    }
-    else
-    {
-        // Get array index for thread local storage
-        pthread_mutex_lock( &num_threads_mtx );
-        local_info_array_index = num_threads;
-        num_threads++;
-        pthread_mutex_unlock( &num_threads_mtx );
-
-        if( local_info_array_index >= MAX_THREAD_CNT )
-        {
-            fprintf( stderr, "Maximum thread count reached. No information gathered for this thread."
-                             " To increase the maximum number of observable threads you need to "
-                             "recompile the plugin.\n" );
-            return;
-        }
-
-        // All other threads store their info in thread local storage to avoid synchronization.
-        region_info *current, *tmp;
-        local_region_info* new;
-
-        HASH_ITER( hh, regions, current, tmp )
-        {
-            new = calloc( 1, sizeof( local_region_info ) );
-            new->region_handle = current->region_handle;
-            HASH_ADD( hh, local_info_array[local_info_array_index], region_handle,
-                                                                        sizeof( uint32_t ), new );
-        }
-    }
 }
 
 /**
@@ -786,23 +656,12 @@ void on_create_location( const struct SCOREP_Location*                          
  */
 void on_delete_location( __attribute__((unused)) const struct SCOREP_Location*            location )
 {
-    if (printed_warning && !continue_despite) return;
-    if( local_info_array_index < MAX_THREAD_CNT )
-    {
-        local_region_info *current, *tmp;
-
-        HASH_ITER( hh, local_info_array[local_info_array_index], current, tmp )
-        {
-            HASH_DEL( local_info_array[local_info_array_index], current );
-            free( current );
-        }
-
-        local_info_array[local_info_array_index] = NULL;
+    // clean up this thread's shadow stack and freelist
+    if (!shadow_stack_empty()) {
+        fprintf(stderr, "WARN: shadow of thread not empty!");
     }
 
-    pthread_mutex_lock( &num_threads_mtx );
-    num_threads--;
-    pthread_mutex_unlock( &num_threads_mtx );
+    shadow_stack_cleanup();
 }
 
 /**
@@ -866,10 +725,6 @@ static int init( void )
         }
     }
 
-    FILE* maps=fopen("/proc/self/maps","r");
-    fscanf(maps,"%llx",&base_pointer);
-    fclose(maps);
-
     return 0;
 }
 
@@ -912,15 +767,26 @@ static void on_write_data( void )
                         current->call_cnt,
                         current->duration,
                         current->mean_duration,
-                        current->optimized ? "compiler-optimized" : current->deletable ? ( current->inactive ? "deleted" : "deletable" ) : " " );
+                        current->optimized ? "compiler-optimized" : current->inactive ? "inactive" : " " );
         }
     }
+
     if ( create_filter )
     {
-        char filename[1024], backup[1024];
-        sprintf( filename, "%s/df-filter.list.%d", callbacks->SCOREP_GetExperimentDirName(), getpid() );
+        const char *experiment_dir = callbacks->SCOREP_GetExperimentDirName();
+        size_t experiment_dir_len = strlen(experiment_dir);
+        size_t filename_len = experiment_dir_len + 16 + 10 + 1;
+        char *filename = malloc(filename_len);
+        int ret = snprintf( filename, filename_len, "%s/df-filter.list.%d", experiment_dir, getpid() );
+        if (ret < 0 || filename_len < (size_t)ret) {
+            printf("Failed to create filter file (filename truncated?)\n");
+            free(filename);
+            return;
+        }
         printf("%s\n",filename);
-        sprintf( backup, "%s.old", filename );
+        size_t backup_len = filename_len + 4;
+        char *backup = malloc(backup_len);
+        snprintf( backup, backup_len, "%s.old", filename );
 
         int fd = open( filename, O_CREAT | O_WRONLY | O_EXCL, S_IRUSR | S_IWUSR );
         if( fd < 0 && errno == EEXIST )
@@ -946,7 +812,7 @@ static void on_write_data( void )
                 {
                     if( first )
                     {
-                        fprintf( fp, "EXCLUDE %s\n", current->region_name );
+                        fprintf( fp, "EXCLUDE MANGLED %s\n", current->region_name );
                         first = false;
                     }
                     else
@@ -964,6 +830,8 @@ static void on_write_data( void )
             // File still could not be created. Dump an error message.
             fprintf( stderr, "Couldn't create filter list.\n" );
         }
+        free(filename);
+        free(backup);
     }
 }
 
@@ -1014,11 +882,8 @@ static uint32_t event_functions( __attribute__((unused)) SCOREP_Substrates_Mode 
     SCOREP_Substrates_Callback* ret = calloc( SCOREP_SUBSTRATES_NUM_EVENTS,
                                                     sizeof( SCOREP_Substrates_Callback ) );
 
-    ret[SCOREP_EVENT_ENTER_REGION] = (SCOREP_Substrates_Callback) on_enter_region;
-    ret[SCOREP_EVENT_EXIT_REGION]  = (SCOREP_Substrates_Callback) on_exit_region;
-    ret[SCOREP_EVENT_THREAD_FORK_JOIN_TEAM_BEGIN]  = (SCOREP_Substrates_Callback) on_team_begin;
-    ret[SCOREP_EVENT_THREAD_FORK_JOIN_TEAM_END]    = (SCOREP_Substrates_Callback) on_team_end;
-    ret[SCOREP_EVENT_THREAD_FORK_JOIN_JOIN]        = (SCOREP_Substrates_Callback) on_join;
+    ret[SCOREP_EVENT_PRE_ENTER_REGION] = (SCOREP_Substrates_Callback) on_pre_enter_region;
+    ret[SCOREP_EVENT_PRE_EXIT_REGION]  = (SCOREP_Substrates_Callback) on_pre_exit_region;
 
     *functions = ret;
     return SCOREP_SUBSTRATES_NUM_EVENTS;
