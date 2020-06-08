@@ -866,6 +866,7 @@ static void finalize( void )
     HASH_ITER( hh, regions, current, tmp )
     {
         HASH_DEL( regions, current );
+        free( current->region_name );
         free( current );
     }
 
